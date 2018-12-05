@@ -8,27 +8,57 @@
 // except according to those terms.
 
 use crossbeam_channel::{self, Sender};
-use ipc::{self, IpcReceiverSet, IpcSender, IpcSharedMemory};
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 use ipc::IpcReceiver;
-use router::ROUTER;
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+use ipc::{self, IpcReceiverSet, IpcSender, IpcSharedMemory};
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 use libc;
+use router::ROUTER;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cell::RefCell;
 use std::iter;
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 use std::ptr;
 use std::sync::Arc;
 use std::thread;
 
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 use ipc::IpcOneShotServer;
 
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 use std::io::Error;
 
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 // I'm not actually sure invoking this is indeed unsafe -- but better safe than sorry...
 pub unsafe fn fork<F: FnOnce()>(child_func: F) -> libc::pid_t {
     match libc::fork() {
@@ -36,17 +66,27 @@ pub unsafe fn fork<F: FnOnce()>(child_func: F) -> libc::pid_t {
         0 => {
             child_func();
             libc::exit(0);
-        },
+        }
         pid => pid,
     }
 }
 
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 pub trait Wait {
     fn wait(self);
 }
 
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 impl Wait for libc::pid_t {
     fn wait(self) {
         unsafe {
@@ -104,15 +144,25 @@ fn select() {
 
     let person = ("Patrick Walton".to_owned(), 29);
     tx0.send(person.clone()).unwrap();
-    let (received_id, received_data) =
-        rx_set.select().unwrap().into_iter().next().unwrap().unwrap();
+    let (received_id, received_data) = rx_set
+        .select()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
     let received_person: Person = received_data.to().unwrap();
     assert_eq!(received_id, rx0_id);
     assert_eq!(received_person, person);
 
     tx1.send(person.clone()).unwrap();
-    let (received_id, received_data) =
-        rx_set.select().unwrap().into_iter().next().unwrap().unwrap();
+    let (received_id, received_data) = rx_set
+        .select()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
     let received_person: Person = received_data.to().unwrap();
     assert_eq!(received_id, rx1_id);
     assert_eq!(received_person, person);
@@ -137,20 +187,27 @@ fn select() {
     }
 }
 
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 #[test]
 fn cross_process_embedded_senders() {
     let person = ("Patrick Walton".to_owned(), 29);
-    let (server0, server0_name) = IpcOneShotServer::new().unwrap();
-    let (server2, server2_name) = IpcOneShotServer::new().unwrap();
-    let child_pid = unsafe { fork(|| {
-        let (tx1, rx1): (IpcSender<Person>, IpcReceiver<Person>) = ipc::channel().unwrap();
-        let tx0 = IpcSender::connect(server0_name).unwrap();
-        tx0.send(tx1).unwrap();
-        rx1.recv().unwrap();
-        let tx2: IpcSender<Person> = IpcSender::connect(server2_name).unwrap();
-        tx2.send(person.clone()).unwrap();
-    })};
+    let (server0, server0_name) = IpcOneShotServer::new(None).unwrap();
+    let (server2, server2_name) = IpcOneShotServer::new(None).unwrap();
+    let child_pid = unsafe {
+        fork(|| {
+            let (tx1, rx1): (IpcSender<Person>, IpcReceiver<Person>) = ipc::channel().unwrap();
+            let tx0 = IpcSender::connect(server0_name).unwrap();
+            tx0.send(tx1).unwrap();
+            rx1.recv().unwrap();
+            let tx2: IpcSender<Person> = IpcSender::connect(server2_name).unwrap();
+            tx2.send(person.clone()).unwrap();
+        })
+    };
     let (_, tx1): (_, IpcSender<Person>) = server0.accept().unwrap();
     tx1.send(person.clone()).unwrap();
     let (_, received_person): (_, Person) = server2.accept().unwrap();
@@ -165,9 +222,12 @@ fn router_simple() {
     tx.send(person.clone()).unwrap();
 
     let (callback_fired_sender, callback_fired_receiver) = crossbeam_channel::unbounded::<Person>();
-    ROUTER.add_route(rx.to_opaque(), Box::new(move |person| {
-        callback_fired_sender.send(person.to().unwrap()).unwrap();
-    }));
+    ROUTER.add_route(
+        rx.to_opaque(),
+        Box::new(move |person| {
+            callback_fired_sender.send(person.to().unwrap()).unwrap();
+        }),
+    );
     let received_person = callback_fired_receiver.recv().unwrap();
     assert_eq!(received_person, person);
 }
@@ -232,9 +292,7 @@ fn router_drops_callbacks_on_sender_shutdown() {
 
     let (tx0, rx0) = ipc::channel::<()>().unwrap();
     let (drop_tx, drop_rx) = crossbeam_channel::unbounded();
-    let dropper = Dropper {
-        sender: drop_tx,
-    };
+    let dropper = Dropper { sender: drop_tx };
 
     ROUTER.add_route(rx0.to_opaque(), Box::new(move |_| drop(&dropper)));
     drop(tx0);
@@ -255,9 +313,7 @@ fn router_drops_callbacks_on_cloned_sender_shutdown() {
 
     let (tx0, rx0) = ipc::channel::<()>().unwrap();
     let (drop_tx, drop_rx) = crossbeam_channel::unbounded();
-    let dropper = Dropper {
-        sender: drop_tx,
-    };
+    let dropper = Dropper { sender: drop_tx };
 
     ROUTER.add_route(rx0.to_opaque(), Box::new(move |_| drop(&dropper)));
     let txs = vec![tx0.clone(), tx0.clone(), tx0.clone()];
@@ -278,9 +334,10 @@ fn router_big_data() {
 
     let (callback_fired_sender, callback_fired_receiver) =
         crossbeam_channel::unbounded::<Vec<Person>>();
-    ROUTER.add_route(rx.to_opaque(), Box::new(move |people| {
-        callback_fired_sender.send(people.to().unwrap()).unwrap()
-    }));
+    ROUTER.add_route(
+        rx.to_opaque(),
+        Box::new(move |people| callback_fired_sender.send(people.to().unwrap()).unwrap()),
+    );
     let received_people = callback_fired_receiver.recv().unwrap();
     assert_eq!(received_people, people);
     thread.join().unwrap();
@@ -289,14 +346,18 @@ fn router_big_data() {
 #[test]
 fn shared_memory() {
     let person = ("Patrick Walton".to_owned(), 29);
-    let person_and_shared_memory =
-        (person, IpcSharedMemory::from_byte(0xba, 1024 * 1024));
+    let person_and_shared_memory = (person, IpcSharedMemory::from_byte(0xba, 1024 * 1024));
     let (tx, rx) = ipc::channel().unwrap();
     tx.send(person_and_shared_memory.clone()).unwrap();
     let received_person_and_shared_memory = rx.recv().unwrap();
     assert_eq!(received_person_and_shared_memory, person_and_shared_memory);
     assert!(person_and_shared_memory.1.iter().all(|byte| *byte == 0xba));
-    assert!(received_person_and_shared_memory.1.iter().all(|byte| *byte == 0xba));
+    assert!(
+        received_person_and_shared_memory
+            .1
+            .iter()
+            .all(|byte| *byte == 0xba)
+    );
 }
 
 #[test]
@@ -319,7 +380,11 @@ fn embedded_opaque_senders() {
     super_tx.send(person_and_sender).unwrap();
     let received_person_and_sender = super_rx.recv().unwrap();
     assert_eq!(received_person_and_sender.0, person);
-    received_person_and_sender.1.to::<Person>().send(person.clone()).unwrap();
+    received_person_and_sender
+        .1
+        .to::<Person>()
+        .send(person.clone())
+        .unwrap();
     let received_person = sub_rx.recv().unwrap();
     assert_eq!(received_person, person);
 }
@@ -343,7 +408,7 @@ fn multiple_paths_to_a_sender() {
     let send_data = vec![
         person_and_sender.clone(),
         person_and_sender.clone(),
-        person_and_sender.clone()
+        person_and_sender.clone(),
     ];
     let (super_tx, super_rx) = ipc::channel().unwrap();
     super_tx.send(send_data).unwrap();
@@ -388,22 +453,31 @@ fn test_so_linger() {
     drop(sender);
     let val = match receiver.recv() {
         Ok(val) => val,
-        Err(e) => { panic!("err: `{}`", e); }
+        Err(e) => {
+            panic!("err: `{}`", e);
+        }
     };
     assert_eq!(val, 42);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct HasWeirdSerializer (Option<String>);
+struct HasWeirdSerializer(Option<String>);
 
 thread_local! { static WEIRD_CHANNEL: RefCell<Option<IpcSender<HasWeirdSerializer>>> = RefCell::new(None) }
 
 impl Serialize for HasWeirdSerializer {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where S: Serializer
+    where
+        S: Serializer,
     {
         if self.0.is_some() {
-            WEIRD_CHANNEL.with(|chan| { chan.borrow().as_ref().unwrap().send(HasWeirdSerializer(None)).unwrap(); });
+            WEIRD_CHANNEL.with(|chan| {
+                chan.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .send(HasWeirdSerializer(None))
+                    .unwrap();
+            });
         }
         self.0.serialize(serializer)
     }
@@ -411,9 +485,12 @@ impl Serialize for HasWeirdSerializer {
 
 impl<'de> Deserialize<'de> for HasWeirdSerializer {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where D: Deserializer<'de>
+    where
+        D: Deserializer<'de>,
     {
-        Ok(HasWeirdSerializer(try!(Deserialize::deserialize(deserializer))))
+        Ok(HasWeirdSerializer(try!(Deserialize::deserialize(
+            deserializer
+        ))))
     }
 }
 
@@ -422,7 +499,9 @@ fn test_reentrant() {
     let null = HasWeirdSerializer(None);
     let hello = HasWeirdSerializer(Some(String::from("hello")));
     let (sender, receiver) = ipc::channel().unwrap();
-    WEIRD_CHANNEL.with(|chan| { *chan.borrow_mut() = Some(sender.clone()); });
+    WEIRD_CHANNEL.with(|chan| {
+        *chan.borrow_mut() = Some(sender.clone());
+    });
     sender.send(hello.clone()).unwrap();
     assert_eq!(null, receiver.recv().unwrap());
     assert_eq!(hello, receiver.recv().unwrap());

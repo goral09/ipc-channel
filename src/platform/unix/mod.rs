@@ -10,9 +10,11 @@
 use bincode;
 use fnv::FnvHasher;
 use libc::{self, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, SOCK_SEQPACKET, SOL_SOCKET};
-use libc::{SO_LINGER, S_IFMT, S_IFSOCK, c_char, c_int, c_void, getsockopt};
+use libc::{c_char, c_int, c_void, getsockopt, SO_LINGER, S_IFMT, S_IFSOCK};
 use libc::{iovec, mode_t, msghdr, off_t, recvmsg, sendmsg};
-use libc::{setsockopt, size_t, sockaddr, sockaddr_un, socketpair, socklen_t, sa_family_t};
+use libc::{sa_family_t, setsockopt, size_t, sockaddr, sockaddr_un, socketpair, socklen_t};
+use mio::unix::EventedFd;
+use mio::{Events, Poll, PollOpt, Ready, Token};
 use std::cell::Cell;
 use std::cmp;
 use std::collections::HashMap;
@@ -25,12 +27,10 @@ use std::mem;
 use std::ops::{Deref, RangeFrom};
 use std::ptr;
 use std::slice;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
-use std::time::UNIX_EPOCH;
+use std::sync::Arc;
 use std::thread;
-use mio::unix::EventedFd;
-use mio::{Poll, Token, Events, Ready, PollOpt};
+use std::time::UNIX_EPOCH;
 use tempfile::{Builder, TempDir};
 
 const MAX_FDS_IN_CMSG: u32 = 64;
@@ -54,8 +54,11 @@ type MsgControlLen = socklen_t;
 
 unsafe fn new_sockaddr_un(path: *const c_char) -> (sockaddr_un, usize) {
     let mut sockaddr: sockaddr_un = mem::zeroed();
-    libc::strncpy(sockaddr.sun_path.as_mut_ptr(),
-                  path, sockaddr.sun_path.len() - 1);
+    libc::strncpy(
+        sockaddr.sun_path.as_mut_ptr(),
+        path,
+        sockaddr.sun_path.len() - 1,
+    );
     sockaddr.sun_family = libc::AF_UNIX as sa_family_t;
     (sockaddr, mem::size_of::<sockaddr_un>())
 }
@@ -63,7 +66,8 @@ unsafe fn new_sockaddr_un(path: *const c_char) -> (sockaddr_un, usize) {
 lazy_static! {
     static ref SYSTEM_SENDBUF_SIZE: usize = {
         let (tx, _) = channel().expect("Failed to obtain a socket for checking maximum send size");
-        tx.get_system_sendbuf_size().expect("Failed to obtain maximum send size for socket")
+        tx.get_system_sendbuf_size()
+            .expect("Failed to obtain maximum send size for socket")
     };
 }
 
@@ -75,11 +79,14 @@ lazy_static! {
 // A global count used to create unique IDs
 static SHM_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
-pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),UnixError> {
+pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver), UnixError> {
     let mut results = [0, 0];
     unsafe {
         if socketpair(libc::AF_UNIX, SOCK_SEQPACKET, 0, &mut results[0]) >= 0 {
-            Ok((OsIpcSender::from_fd(results[0]), OsIpcReceiver::from_fd(results[1])))
+            Ok((
+                OsIpcSender::from_fd(results[0]),
+                OsIpcReceiver::from_fd(results[1]),
+            ))
         } else {
             Err(UnixError::last())
         }
@@ -89,7 +96,7 @@ pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),UnixError> {
 #[derive(Clone, Copy)]
 struct PollEntry {
     pub id: u64,
-    pub fd: c_int
+    pub fd: c_int,
 }
 
 #[derive(PartialEq, Debug)]
@@ -110,9 +117,7 @@ impl Drop for OsIpcReceiver {
 
 impl OsIpcReceiver {
     fn from_fd(fd: c_int) -> OsIpcReceiver {
-        OsIpcReceiver {
-            fd: Cell::new(fd),
-        }
+        OsIpcReceiver { fd: Cell::new(fd) }
     }
 
     fn consume_fd(&self) -> c_int {
@@ -125,13 +130,15 @@ impl OsIpcReceiver {
         OsIpcReceiver::from_fd(self.consume_fd())
     }
 
-    pub fn recv(&self)
-                -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),UnixError> {
+    pub fn recv(
+        &self,
+    ) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>), UnixError> {
         recv(self.fd.get(), BlockingMode::Blocking)
     }
 
-    pub fn try_recv(&self)
-                    -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),UnixError> {
+    pub fn try_recv(
+        &self,
+    ) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>), UnixError> {
         recv(self.fd.get(), BlockingMode::Nonblocking)
     }
 }
@@ -170,16 +177,19 @@ impl OsIpcSender {
     ///
     /// Note: This is *not* the actual maximal packet size we are allowed to use...
     /// Some of it is reserved by the kernel for bookkeeping.
-    fn get_system_sendbuf_size(&self) -> Result<usize,UnixError> {
+    fn get_system_sendbuf_size(&self) -> Result<usize, UnixError> {
         unsafe {
             let mut socket_sendbuf_size: usize = 0;
             let mut socket_sendbuf_size_len = mem::size_of::<usize>() as socklen_t;
-            if getsockopt(self.fd.0,
-                          libc::SOL_SOCKET,
-                          libc::SO_SNDBUF,
-                          &mut socket_sendbuf_size as *mut _ as *mut c_void,
-                          &mut socket_sendbuf_size_len as *mut socklen_t) < 0 {
-                return Err(UnixError::last())
+            if getsockopt(
+                self.fd.0,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &mut socket_sendbuf_size as *mut _ as *mut c_void,
+                &mut socket_sendbuf_size_len as *mut socklen_t,
+            ) < 0
+            {
+                return Err(UnixError::last());
             }
             Ok(socket_sendbuf_size)
         }
@@ -200,8 +210,7 @@ impl OsIpcSender {
     ///
     /// This one is smaller than regular fragments, because it carries the message (size) header.
     fn first_fragment_size(sendbuf_size: usize) -> usize {
-        (Self::fragment_size(sendbuf_size) - mem::size_of::<usize>())
-            & (!8usize + 1) // Ensure optimal alignment.
+        (Self::fragment_size(sendbuf_size) - mem::size_of::<usize>()) & (!8usize + 1) // Ensure optimal alignment.
     }
 
     /// Maximum data size that can be transferred over this channel in a single packet.
@@ -217,12 +226,12 @@ impl OsIpcSender {
         Self::first_fragment_size(*SYSTEM_SENDBUF_SIZE)
     }
 
-    pub fn send(&self,
-                data: &[u8],
-                channels: Vec<OsIpcChannel>,
-                shared_memory_regions: Vec<OsIpcSharedMemory>)
-                -> Result<(),UnixError> {
-
+    pub fn send(
+        &self,
+        data: &[u8],
+        channels: Vec<OsIpcChannel>,
+        shared_memory_regions: Vec<OsIpcSharedMemory>,
+    ) -> Result<(), UnixError> {
         let mut fds = Vec::new();
         for channel in channels.iter() {
             fds.push(channel.fd());
@@ -237,8 +246,12 @@ impl OsIpcSender {
         // Not to be confused with the length of the data to send in this packet
         // (i.e. the length of the data buffer passed in),
         // which in a fragmented send will be smaller than the total message length.
-        fn send_first_fragment(sender_fd: c_int, fds: &[c_int], data_buffer: &[u8], len: usize)
-                               -> Result<(),UnixError> {
+        fn send_first_fragment(
+            sender_fd: c_int,
+            fds: &[c_int],
+            data_buffer: &[u8],
+            len: usize,
+        ) -> Result<(), UnixError> {
             let result = unsafe {
                 let cmsg_length = mem::size_of_val(fds);
                 let (cmsg_buffer, cmsg_space) = if cmsg_length > 0 {
@@ -247,9 +260,11 @@ impl OsIpcSender {
                     (*cmsg_buffer).cmsg_level = libc::SOL_SOCKET;
                     (*cmsg_buffer).cmsg_type = SCM_RIGHTS;
 
-                    ptr::copy_nonoverlapping(fds.as_ptr(),
-                                             CMSG_DATA(cmsg_buffer) as *mut c_int,
-                                             fds.len());
+                    ptr::copy_nonoverlapping(
+                        fds.as_ptr(),
+                        CMSG_DATA(cmsg_buffer) as *mut c_int,
+                        fds.len(),
+                    );
                     (cmsg_buffer, CMSG_SPACE(cmsg_length))
                 } else {
                     (ptr::null_mut(), 0)
@@ -293,12 +308,14 @@ impl OsIpcSender {
             }
         };
 
-        fn send_followup_fragment(sender_fd: c_int, data_buffer: &[u8]) -> Result<(),UnixError> {
+        fn send_followup_fragment(sender_fd: c_int, data_buffer: &[u8]) -> Result<(), UnixError> {
             let result = unsafe {
-                libc::send(sender_fd,
-                           data_buffer.as_ptr() as *const c_void,
-                           data_buffer.len(),
-                           0)
+                libc::send(
+                    sender_fd,
+                    data_buffer.as_ptr() as *const c_void,
+                    data_buffer.len(),
+                    0,
+                )
             };
 
             if result > 0 {
@@ -318,7 +335,7 @@ impl OsIpcSender {
         /// if means something else must have gone wrong;
         /// so there is no point in further downsizing,
         /// and we error out instead.)
-        fn downsize(sendbuf_size: &mut usize, sent_size: usize) -> Result<(),()> {
+        fn downsize(sendbuf_size: &mut usize, sent_size: usize) -> Result<(), ()> {
             if sent_size > 2000 {
                 *sendbuf_size /= 2;
                 // Make certain we end up with less than what we tried before...
@@ -344,10 +361,11 @@ impl OsIpcSender {
                     //
                     // Any other errors we might get here are non-recoverable.
                     if !(error == UnixError::Errno(libc::ENOBUFS)
-                         && downsize(&mut sendbuf_size, data.len()).is_ok()) {
-                        return Err(error)
+                        && downsize(&mut sendbuf_size, data.len()).is_ok())
+                    {
+                        return Err(error);
                     }
-                },
+                }
             }
         }
 
@@ -376,19 +394,22 @@ impl OsIpcSender {
             } else {
                 // Followup fragment. No header; but offset by amount of data already sent.
 
-                end_byte_position = cmp::min(byte_position + Self::fragment_size(sendbuf_size),
-                                             data.len());
+                end_byte_position = cmp::min(
+                    byte_position + Self::fragment_size(sendbuf_size),
+                    data.len(),
+                );
                 send_followup_fragment(dedicated_tx.fd.0, &data[byte_position..end_byte_position])
             };
 
             if let Err(error) = result {
                 if error == UnixError::Errno(libc::ENOBUFS)
-                   && downsize(&mut sendbuf_size, end_byte_position - byte_position).is_ok() {
+                    && downsize(&mut sendbuf_size, end_byte_position - byte_position).is_ok()
+                {
                     // If the kernel failed to allocate a buffer large enough for the packet,
                     // retry with a smaller size (if possible).
-                    continue
+                    continue;
                 } else {
-                    return Err(error)
+                    return Err(error);
                 }
             }
 
@@ -398,13 +419,18 @@ impl OsIpcSender {
         Ok(())
     }
 
-    pub fn connect(name: String) -> Result<OsIpcSender,UnixError> {
+    pub fn connect(name: String) -> Result<OsIpcSender, UnixError> {
         let name = CString::new(name).unwrap();
         unsafe {
             let fd = libc::socket(libc::AF_UNIX, SOCK_SEQPACKET, 0);
             let (sockaddr, len) = new_sockaddr_un(name.as_ptr());
-            if libc::connect(fd, &sockaddr as *const _ as *const sockaddr, len as socklen_t) < 0 {
-                return Err(UnixError::last())
+            if libc::connect(
+                fd,
+                &sockaddr as *const _ as *const sockaddr,
+                len as socklen_t,
+            ) < 0
+            {
+                return Err(UnixError::last());
             }
 
             Ok(OsIpcSender::from_fd(fd))
@@ -431,56 +457,54 @@ pub struct OsIpcReceiverSet {
     incrementor: RangeFrom<u64>,
     poll: Poll,
     pollfds: HashMap<Token, PollEntry, BuildHasherDefault<FnvHasher>>,
-    events: Events
+    events: Events,
 }
 
 impl Drop for OsIpcReceiverSet {
     fn drop(&mut self) {
         for &PollEntry { id: _, fd } in self.pollfds.values() {
-            let result = unsafe {
-                libc::close(fd)
-            };
+            let result = unsafe { libc::close(fd) };
             assert!(thread::panicking() || result == 0);
         }
     }
 }
 
 impl OsIpcReceiverSet {
-    pub fn new() -> Result<OsIpcReceiverSet,UnixError> {
+    pub fn new() -> Result<OsIpcReceiverSet, UnixError> {
         let fnv = BuildHasherDefault::<FnvHasher>::default();
         Ok(OsIpcReceiverSet {
             incrementor: 0..,
             poll: try!(Poll::new()),
             pollfds: HashMap::with_hasher(fnv),
-            events: Events::with_capacity(10)
+            events: Events::with_capacity(10),
         })
     }
 
-    pub fn add(&mut self, receiver: OsIpcReceiver) -> Result<u64,UnixError> {
+    pub fn add(&mut self, receiver: OsIpcReceiver) -> Result<u64, UnixError> {
         let last_index = self.incrementor.next().unwrap();
         let fd = receiver.consume_fd();
         let io = EventedFd(&fd);
         let fd_token = Token(fd as usize);
         let poll_entry = PollEntry {
             id: last_index,
-            fd: fd
+            fd: fd,
         };
-        try!(self.poll.register(&io,
-                                fd_token,
-                                Ready::readable(),
-                                PollOpt::level()));
+        try!(
+            self.poll
+                .register(&io, fd_token, Ready::readable(), PollOpt::level())
+        );
         self.pollfds.insert(fd_token, poll_entry);
         Ok(last_index)
     }
 
-    pub fn select(&mut self) -> Result<Vec<OsIpcSelectionResult>,UnixError> {
+    pub fn select(&mut self) -> Result<Vec<OsIpcSelectionResult>, UnixError> {
         let mut selection_results = Vec::new();
         let mut num_events = 0;
         while num_events == 0 {
             match self.poll.poll(&mut self.events, None) {
                 Ok(sz) => {
                     num_events = sz;
-                },
+                }
                 Err(ref e) => {
                     if e.kind() != ErrorKind::Interrupted {
                         return Err(UnixError::last());
@@ -492,33 +516,36 @@ impl OsIpcReceiverSet {
         for evt in self.events.iter() {
             let evt_token = evt.token();
             match (evt.readiness().is_readable(), self.pollfds.get(&evt_token)) {
-                (true, Some(&poll_entry)) => {
-                    match recv(poll_entry.fd, BlockingMode::Blocking) {
-                        Ok((data, channels, shared_memory_regions)) => {
-                            selection_results.push(OsIpcSelectionResult::DataReceived(
-                                    poll_entry.id,
-                                    data,
-                                    channels,
-                                    shared_memory_regions));
-                        }
-                        Err(err) if err.channel_is_closed() => {
-                            self.pollfds.remove(&evt_token).unwrap();
-                            self.poll.deregister(&EventedFd(&poll_entry.fd)).unwrap();
-                            unsafe {
-                                libc::close(poll_entry.fd);
-                            }
-                            selection_results.push(OsIpcSelectionResult::ChannelClosed(poll_entry.id))
-                        }
-                        Err(err) => return Err(err),
+                (true, Some(&poll_entry)) => match recv(poll_entry.fd, BlockingMode::Blocking) {
+                    Ok((data, channels, shared_memory_regions)) => {
+                        selection_results.push(OsIpcSelectionResult::DataReceived(
+                            poll_entry.id,
+                            data,
+                            channels,
+                            shared_memory_regions,
+                        ));
                     }
+                    Err(err) if err.channel_is_closed() => {
+                        self.pollfds.remove(&evt_token).unwrap();
+                        self.poll.deregister(&EventedFd(&poll_entry.fd)).unwrap();
+                        unsafe {
+                            libc::close(poll_entry.fd);
+                        }
+                        selection_results.push(OsIpcSelectionResult::ChannelClosed(poll_entry.id))
+                    }
+                    Err(err) => return Err(err),
                 },
                 (true, None) => {
-                    panic!("Readable event for unknown token: {:?}, readiness: {:?}",
-                           evt_token, evt.readiness());
-                },
-                (false, _) => {
-                    panic!("Received an event that was not readable for token: {:?}", evt_token)
+                    panic!(
+                        "Readable event for unknown token: {:?}, readiness: {:?}",
+                        evt_token,
+                        evt.readiness()
+                    );
                 }
+                (false, _) => panic!(
+                    "Received an event that was not readable for token: {:?}",
+                    evt_token
+                ),
             }
         }
 
@@ -527,19 +554,32 @@ impl OsIpcReceiverSet {
 }
 
 pub enum OsIpcSelectionResult {
-    DataReceived(u64, Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),
+    DataReceived(
+        u64,
+        Vec<u8>,
+        Vec<OsOpaqueIpcChannel>,
+        Vec<OsIpcSharedMemory>,
+    ),
     ChannelClosed(u64),
 }
 
 impl OsIpcSelectionResult {
-    pub fn unwrap(self) -> (u64, Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>) {
+    pub fn unwrap(
+        self,
+    ) -> (
+        u64,
+        Vec<u8>,
+        Vec<OsOpaqueIpcChannel>,
+        Vec<OsIpcSharedMemory>,
+    ) {
         match self {
             OsIpcSelectionResult::DataReceived(id, data, channels, shared_memory_regions) => {
                 (id, data, channels, shared_memory_regions)
             }
-            OsIpcSelectionResult::ChannelClosed(id) => {
-                panic!("OsIpcSelectionResult::unwrap(): receiver ID {} was closed!", id)
-            }
+            OsIpcSelectionResult::ChannelClosed(id) => panic!(
+                "OsIpcSelectionResult::unwrap(): receiver ID {} was closed!",
+                id
+            ),
         }
     }
 }
@@ -562,9 +602,7 @@ impl Drop for OsOpaqueIpcChannel {
 
 impl OsOpaqueIpcChannel {
     fn from_fd(fd: c_int) -> OsOpaqueIpcChannel {
-        OsOpaqueIpcChannel {
-            fd: fd,
-        }
+        OsOpaqueIpcChannel { fd: fd }
     }
 
     pub fn to_sender(&mut self) -> OsIpcSender {
@@ -595,39 +633,54 @@ impl Drop for OsIpcOneShotServer {
 }
 
 impl OsIpcOneShotServer {
-    pub fn new() -> Result<(OsIpcOneShotServer, String),UnixError> {
+    pub fn new(addr: Option<&str>) -> Result<(OsIpcOneShotServer, String), UnixError> {
         unsafe {
             let fd = libc::socket(libc::AF_UNIX, SOCK_SEQPACKET, 0);
             let temp_dir = Builder::new().tempdir().unwrap();
-            let socket_path = temp_dir.path().join("socket");
+            let socket_path = temp_dir.path().join(addr.unwrap_or("socket"));
             let path_string = socket_path.to_str().unwrap();
 
             let (sockaddr, len) = new_sockaddr_un(CString::new(path_string).unwrap().as_ptr());
-            if libc::bind(fd, &sockaddr as *const _ as *const sockaddr, len as socklen_t) != 0 {
+            if libc::bind(
+                fd,
+                &sockaddr as *const _ as *const sockaddr,
+                len as socklen_t,
+            ) != 0
+            {
                 return Err(UnixError::last());
             }
 
             if libc::listen(fd, 10) != 0 {
-                return Err(UnixError::last())
+                return Err(UnixError::last());
             }
 
-            Ok((OsIpcOneShotServer {
-                fd: fd,
-                _temp_dir: temp_dir,
-            }, path_string.to_string()))
+            Ok((
+                OsIpcOneShotServer {
+                    fd: fd,
+                    _temp_dir: temp_dir,
+                },
+                path_string.to_string(),
+            ))
         }
     }
 
-    pub fn accept(self) -> Result<(OsIpcReceiver,
-                                   Vec<u8>,
-                                   Vec<OsOpaqueIpcChannel>,
-                                   Vec<OsIpcSharedMemory>),UnixError> {
+    pub fn accept(
+        self,
+    ) -> Result<
+        (
+            OsIpcReceiver,
+            Vec<u8>,
+            Vec<OsOpaqueIpcChannel>,
+            Vec<OsIpcSharedMemory>,
+        ),
+        UnixError,
+    > {
         unsafe {
             let sockaddr: *mut sockaddr = ptr::null_mut();
             let sockaddr_len: *mut socklen_t = ptr::null_mut();
             let client_fd = libc::accept(self.fd, sockaddr, sockaddr_len);
             if client_fd < 0 {
-                return Err(UnixError::last())
+                return Err(UnixError::last());
             }
             try!(make_socket_lingering(client_fd));
 
@@ -642,44 +695,47 @@ impl OsIpcOneShotServer {
 // close our end.
 //
 // See, for example, https://github.com/servo/ipc-channel/issues/29
-fn make_socket_lingering(sockfd: c_int) -> Result<(),UnixError> {
+fn make_socket_lingering(sockfd: c_int) -> Result<(), UnixError> {
     let linger = linger {
         l_onoff: 1,
         l_linger: 30,
     };
     let err = unsafe {
-        setsockopt(sockfd,
-                   SOL_SOCKET,
-                   SO_LINGER,
-                   &linger as *const _ as *const c_void,
-                   mem::size_of::<linger>() as socklen_t)
+        setsockopt(
+            sockfd,
+            SOL_SOCKET,
+            SO_LINGER,
+            &linger as *const _ as *const c_void,
+            mem::size_of::<linger>() as socklen_t,
+        )
     };
     if err < 0 {
-        return Err(UnixError::last())
+        return Err(UnixError::last());
     }
     Ok(())
 }
 
 struct BackingStore {
-    fd: c_int
+    fd: c_int,
 }
 
 impl BackingStore {
     pub fn new(length: usize) -> BackingStore {
         let count = SHM_COUNT.fetch_add(1, Ordering::Relaxed);
         let timestamp = UNIX_EPOCH.elapsed().unwrap();
-        let name = CString::new(format!("/ipc-channel-shared-memory.{}.{}.{}.{}",
-                                        count, *PID,
-                                        timestamp.as_secs(),
-                                        timestamp.subsec_nanos())).unwrap();
+        let name = CString::new(format!(
+            "/ipc-channel-shared-memory.{}.{}.{}.{}",
+            count,
+            *PID,
+            timestamp.as_secs(),
+            timestamp.subsec_nanos()
+        )).unwrap();
         let fd = create_shmem(name, length);
         Self::from_fd(fd)
     }
 
     pub fn from_fd(fd: c_int) -> BackingStore {
-        BackingStore {
-            fd: fd,
-        }
+        BackingStore { fd: fd }
     }
 
     pub fn fd(&self) -> c_int {
@@ -694,14 +750,16 @@ impl BackingStore {
         });
         if length == 0 {
             // This will cause `mmap` to fail, so handle it explicitly.
-            return (ptr::null_mut(), length)
+            return (ptr::null_mut(), length);
         }
-        let address = libc::mmap(ptr::null_mut(),
-                                 length,
-                                 PROT_READ | PROT_WRITE,
-                                 MAP_SHARED,
-                                 self.fd,
-                                 0);
+        let address = libc::mmap(
+            ptr::null_mut(),
+            length,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            self.fd,
+            0,
+        );
         assert!(address != ptr::null_mut());
         assert!(address != MAP_FAILED);
         (address as *mut u8, length)
@@ -720,7 +778,7 @@ impl Drop for BackingStore {
 pub struct OsIpcSharedMemory {
     ptr: *mut u8,
     length: usize,
-    store: BackingStore
+    store: BackingStore,
 }
 
 unsafe impl Send for OsIpcSharedMemory {}
@@ -764,15 +822,16 @@ impl Deref for OsIpcSharedMemory {
 
     #[inline]
     fn deref(&self) -> &[u8] {
-        unsafe {
-            slice::from_raw_parts(self.ptr, self.length)
-        }
+        unsafe { slice::from_raw_parts(self.ptr, self.length) }
     }
 }
 
 impl OsIpcSharedMemory {
-    unsafe fn from_raw_parts(ptr: *mut u8, length: usize,
-                             store: BackingStore) -> OsIpcSharedMemory {
+    unsafe fn from_raw_parts(
+        ptr: *mut u8,
+        length: usize,
+        store: BackingStore,
+    ) -> OsIpcSharedMemory {
         OsIpcSharedMemory {
             ptr: ptr,
             length: length,
@@ -834,8 +893,10 @@ impl From<UnixError> for Error {
     fn from(unix_error: UnixError) -> Error {
         match unix_error {
             UnixError::Errno(errno) => Error::from_raw_os_error(errno),
-            UnixError::ChannelClosed => Error::new(ErrorKind::ConnectionReset,
-                                                   "All senders for this socket closed"),
+            UnixError::ChannelClosed => Error::new(
+                ErrorKind::ConnectionReset,
+                "All senders for this socket closed",
+            ),
         }
     }
 }
@@ -857,9 +918,10 @@ enum BlockingMode {
     Nonblocking,
 }
 
-fn recv(fd: c_int, blocking_mode: BlockingMode)
-        -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),UnixError> {
-
+fn recv(
+    fd: c_int,
+    blocking_mode: BlockingMode,
+) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>), UnixError> {
     let (mut channels, mut shared_memory_regions) = (Vec::new(), Vec::new());
 
     // First fragments begins with a header recording the total data length.
@@ -899,7 +961,7 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
             let fd = *cmsg_fds.offset(index as isize);
             if is_socket(fd) {
                 channels.push(OsOpaqueIpcChannel::from_fd(fd));
-                continue
+                continue;
             }
             shared_memory_regions.push(OsIpcSharedMemory::from_fd(fd));
         }
@@ -907,7 +969,7 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
 
     if total_size == main_data_buffer.len() {
         // Fast path: no fragments.
-        return Ok((main_data_buffer, channels, shared_memory_regions))
+        return Ok((main_data_buffer, channels, shared_memory_regions));
     }
 
     // Reassemble fragments.
@@ -923,8 +985,10 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
     // Receive followup fragments directly into the main buffer.
     while main_data_buffer.len() < total_size {
         let write_pos = main_data_buffer.len();
-        let end_pos = cmp::min(write_pos + OsIpcSender::fragment_size(*SYSTEM_SENDBUF_SIZE),
-                               total_size);
+        let end_pos = cmp::min(
+            write_pos + OsIpcSender::fragment_size(*SYSTEM_SENDBUF_SIZE),
+            total_size,
+        );
         let result = unsafe {
             assert!(end_pos <= main_data_buffer.capacity());
             main_data_buffer.set_len(end_pos);
@@ -935,32 +999,36 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
             // Note: we always use blocking mode for followup fragments,
             // to make sure that once we start receiving a multi-fragment message,
             // we don't abort in the middle of it...
-            let result = libc::recv(dedicated_rx.fd.get(),
-                                    main_data_buffer[write_pos..].as_mut_ptr() as *mut c_void,
-                                    end_pos - write_pos,
-                                    0);
+            let result = libc::recv(
+                dedicated_rx.fd.get(),
+                main_data_buffer[write_pos..].as_mut_ptr() as *mut c_void,
+                end_pos - write_pos,
+                0,
+            );
             main_data_buffer.set_len(write_pos + cmp::max(result, 0) as usize);
             result
         };
 
         if result == 0 {
-            return Err(UnixError::ChannelClosed)
+            return Err(UnixError::ChannelClosed);
         } else if result < 0 {
-            return Err(UnixError::last())
+            return Err(UnixError::last());
         };
     }
 
     Ok((main_data_buffer, channels, shared_memory_regions))
 }
 
-#[cfg(not(all(target_os="linux", feature="memfd")))]
+#[cfg(not(all(target_os = "linux", feature = "memfd")))]
 fn create_shmem(name: CString, length: usize) -> c_int {
     unsafe {
         // NB: the FreeBSD man page for shm_unlink states that it requires
         // write permissions, but testing shows that read-write is required.
-        let fd = libc::shm_open(name.as_ptr(),
-                                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
-                                0o600);
+        let fd = libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+            0o600,
+        );
         assert!(fd >= 0);
         assert!(libc::shm_unlink(name.as_ptr()) == 0);
         assert!(libc::ftruncate(fd, length as off_t) == 0);
@@ -968,7 +1036,7 @@ fn create_shmem(name: CString, length: usize) -> c_int {
     }
 }
 
-#[cfg(all(feature="memfd", target_os="linux"))]
+#[cfg(all(feature = "memfd", target_os = "linux"))]
 fn create_shmem(name: CString, length: usize) -> c_int {
     unsafe {
         let fd = memfd_create(name.as_ptr(), 0);
@@ -1011,11 +1079,10 @@ impl UnixCmsg {
         }
     }
 
-    unsafe fn recv(&mut self, fd: c_int, blocking_mode: BlockingMode)
-                   -> Result<usize, UnixError> {
+    unsafe fn recv(&mut self, fd: c_int, blocking_mode: BlockingMode) -> Result<usize, UnixError> {
         if let BlockingMode::Nonblocking = blocking_mode {
             if libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) < 0 {
-                return Err(UnixError::last())
+                return Err(UnixError::last());
             }
         }
 
@@ -1030,7 +1097,7 @@ impl UnixCmsg {
 
         if let BlockingMode::Nonblocking = blocking_mode {
             if libc::fcntl(fd, libc::F_SETFL, 0) < 0 {
-                return Err(UnixError::last())
+                return Err(UnixError::last());
             }
         }
         result
@@ -1045,7 +1112,7 @@ fn is_socket(fd: c_int) -> bool {
     unsafe {
         let mut st = mem::uninitialized();
         if libc::fstat(fd, &mut st) != 0 {
-            return false
+            return false;
         }
         S_ISSOCK(st.st_mode as mode_t)
     }
@@ -1053,7 +1120,7 @@ fn is_socket(fd: c_int) -> bool {
 
 // FFI stuff follows:
 
-#[cfg(all(feature="memfd", target_os="linux"))]
+#[cfg(all(feature = "memfd", target_os = "linux"))]
 unsafe fn memfd_create(name: *const c_char, flags: usize) -> c_int {
     syscall!(MEMFD_CREATE, name, flags) as c_int
 }
@@ -1065,8 +1132,8 @@ fn CMSG_LEN(length: size_t) -> size_t {
 
 #[allow(non_snake_case)]
 unsafe fn CMSG_DATA(cmsg: *mut cmsghdr) -> *mut c_void {
-    (cmsg as *mut libc::c_uchar).offset(CMSG_ALIGN(
-            mem::size_of::<cmsghdr>()) as isize) as *mut c_void
+    (cmsg as *mut libc::c_uchar).offset(CMSG_ALIGN(mem::size_of::<cmsghdr>()) as isize)
+        as *mut c_void
 }
 
 #[allow(non_snake_case)]
@@ -1096,4 +1163,3 @@ struct linger {
     l_onoff: c_int,
     l_linger: c_int,
 }
-
